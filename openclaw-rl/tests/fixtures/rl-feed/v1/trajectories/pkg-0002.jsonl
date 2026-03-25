@@ -1,4 +1,4 @@
 {"turnId":"pkg-0002-t0","role":"user","contentHash":"chash-0002-0","contentScrubbed":"Hello from user","stepIdx":0}
-{"turnId":"pkg-0002-t1","role":"tool","contentHash":"chash-0002-1","toolName":"exec","stepIdx":1}
+{"turnId":"pkg-0002-t1","role":"tool","contentHash":"chash-0002-1","toolName":"exec","contentScrubbed":"Hello from tool","stepIdx":1}
 {"turnId":"pkg-0002-t2","role":"assistant","contentHash":"chash-0002-2","contentScrubbed":"Hello from assistant","stepIdx":2}
 

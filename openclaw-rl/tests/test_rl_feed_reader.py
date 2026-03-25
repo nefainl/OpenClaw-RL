@@ -43,7 +43,7 @@ def test_read_package_plaintext_turns_loads() -> None:
     assistant_turn = next((t for t in pkg.turns if t.role == "assistant"), None)
 
     assert user_turn is not None and user_turn.contentScrubbed is not None
-    assert tool_turn is not None and tool_turn.contentScrubbed is None
+    assert tool_turn is not None and tool_turn.contentScrubbed is not None
     assert assistant_turn is not None and assistant_turn.contentScrubbed is not None
 
     # Strict contract alignment: tool turns must include `toolName` in real exports.

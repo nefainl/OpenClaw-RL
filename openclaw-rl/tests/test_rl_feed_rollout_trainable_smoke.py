@@ -23,12 +23,27 @@ def _install_dummy_slime_processing_utils(monkeypatch) -> None:
 
     class DummyTokenizer:
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
-            # Contract validation: v1 mapper excludes role=tool turns from prompt tokenization.
+            # Contract validation: v2 tokenization requires role=tool turns in the prompt window.
             tool_msgs = [m for m in messages if m.get("role") == "tool"]
-            assert not tool_msgs, "did not expect role=tool messages in prompt_messages"
-            text = "".join(str(m.get("content", "")) for m in messages)
+            assert tool_msgs, "expected role=tool turns in prompt_messages"
+            for tm in tool_msgs:
+                assert tm.get("content", None) is not None, "tool turns require contentScrubbed"
+
+            def render(m):
+                role = m.get("role")
+                content = str(m.get("content", ""))
+                if role == "user":
+                    return f"<|user|>{content}"
+                if role == "tool":
+                    return f"<|tool|>{content}"
+                if role == "assistant":
+                    return f"<|assistant|>{content}<|/assistant|>"
+                return f"<|{role}|>{content}"
+
+            text = "".join(render(m) for m in messages)
             if add_generation_prompt:
-                text += "<gen>"
+                # Prompt-only call appends assistant generation prefix (no content yet).
+                text += "<|assistant|>"
             if tokenize:
                 return [ord(ch) % 50 for ch in text]
             return text
@@ -68,6 +83,8 @@ def test_offline_rollout_produces_trainable_samples_for_plaintext_package(monkey
     s_hash = out[0][0]
     assert s_hash.metadata["packageId"] == "pkg-0001"
     assert s_hash.tokens == []
+    assert s_hash.prompt == ""
+    assert s_hash.response == ""
     assert s_hash.remove_sample is True
     assert s_hash.status == Sample.Status.FAILED
 
@@ -76,6 +93,9 @@ def test_offline_rollout_produces_trainable_samples_for_plaintext_package(monkey
     assert s_plain.remove_sample is False
     assert s_plain.status == Sample.Status.COMPLETED
     assert s_plain.tokens
+    assert isinstance(s_plain.prompt, str) and s_plain.prompt.endswith("<|assistant|>")
+    assert isinstance(s_plain.response, str) and s_plain.response.startswith("Hello from assistant")
+    assert s_plain.response.endswith("<|/assistant|>")
     assert s_plain.loss_mask is not None
     assert s_plain.response_length == len(s_plain.loss_mask)
 

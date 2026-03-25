@@ -5,6 +5,10 @@ from enum import Enum
 from typing import Any, Iterable, Sequence
 
 from .types import ParsedPackage, RewardSignal, TrajectoryTurn
+from .tokenization_contract import (
+    TokenizationRefusedError,
+    tokenization_contract_tokenize_assistant_turn,
+)
 
 
 def _load_sample_class():
@@ -179,34 +183,31 @@ def package_to_sample_groups(args: Any, package: ParsedPackage) -> list[list[Any
         tokens: list[int] = []
         response_length = 0
         response_text = ""
+        prompt_text = ""
         loss_mask: list[int] | None = None
         status = _STATUS_FAILED
         remove_sample = True
 
         try:
-            prompt_messages, response_text_candidate = _build_prompt_messages_for_assistant(
-                turns_sorted, assistant_idx
-            )
-            # Only attempt tokenization when we have scrubbed prompt/response strings.
-            if not hasattr(args, "hf_checkpoint"):
-                raise ValueError("hf_checkpoint missing")
-
-            tokens, loss_mask, response_length = _maybe_tokenize_from_scrubbed_content(
+            prompt_text, response_text, tokens, loss_mask, response_length = tokenization_contract_tokenize_assistant_turn(
                 args,
-                prompt_messages=prompt_messages,
-                response_text=response_text_candidate,
+                turns_sorted=turns_sorted,
+                assistant_turn_index=assistant_idx,
             )
-            response_text = response_text_candidate
             status = _STATUS_COMPLETED
             remove_sample = False
-        except Exception:
-            # Deterministic refusal: hash-only feeds (no contentScrubbed) end here.
+        except TokenizationRefusedError:
+            # Deterministic refusal: missing required `contentScrubbed` in prompt window.
             tokens = []
             response_length = 0
             response_text = ""
+            prompt_text = ""
             loss_mask = None
             status = _STATUS_FAILED
             remove_sample = True
+        except Exception:
+            # Unexpected errors should not silently turn into malformed samples.
+            raise
 
         group: list[Any] = []
         group_index = int(assistant_turn.stepIdx)
@@ -217,6 +218,7 @@ def package_to_sample_groups(args: Any, package: ParsedPackage) -> list[list[Any
             s.group_index = group_index
             s.index = base_index + i
             s.tokens = list(tokens)
+            s.prompt = prompt_text
             s.response = response_text
             s.response_length = int(response_length)
             s.reward = reward

@@ -60,6 +60,9 @@ def read_package(root: Path, package_id: str) -> ParsedPackage:
     if not turns:
         raise ValueError(f"Empty trajectories file for packageId={package_id}")
 
+    # Deterministic ordering for downstream tokenization and grouping.
+    turns = sorted(turns, key=lambda t: (t.stepIdx, t.turnId))
+
     # PR10A exporter encodes `packageId` inside `turnId` as `${packageId}-t${stepIdx}`.
     turn_id_prefix = f"{package_id}-t"
     if not all(t.turnId.startswith(turn_id_prefix) for t in turns):
