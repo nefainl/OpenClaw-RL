@@ -1,0 +1,12 @@
+{
+  "packageId": "pkg-0001",
+  "signals": [
+    {
+      "kind": "binary",
+      "score": 1.0,
+      "source": "prm",
+      "confidence": 0.9
+    }
+  ]
+}
+
