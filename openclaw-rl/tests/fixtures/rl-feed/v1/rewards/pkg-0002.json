@@ -3,9 +3,9 @@
   "signals": [
     {
       "kind": "binary",
-      "score": 1.0,
-      "source": "prm",
-      "confidence": 0.9
+      "source": "approval_decision",
+      "confidence": 0.9,
+      "scalar": 1.0
     }
   ]
 }

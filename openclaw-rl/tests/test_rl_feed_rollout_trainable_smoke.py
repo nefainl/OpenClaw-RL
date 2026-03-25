@@ -22,11 +22,16 @@ def _install_dummy_slime_processing_utils(monkeypatch) -> None:
     processing_mod = types.ModuleType("slime.utils.processing_utils")
 
     class DummyTokenizer:
-        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            # Contract validation: v1 mapper excludes role=tool turns from prompt tokenization.
+            tool_msgs = [m for m in messages if m.get("role") == "tool"]
+            assert not tool_msgs, "did not expect role=tool messages in prompt_messages"
             text = "".join(str(m.get("content", "")) for m in messages)
             if add_generation_prompt:
                 text += "<gen>"
-            return [ord(ch) % 50 for ch in text]
+            if tokenize:
+                return [ord(ch) % 50 for ch in text]
+            return text
 
         def __call__(self, text, add_special_tokens=False):
             return {"input_ids": [ord(ch) % 50 for ch in str(text)]}

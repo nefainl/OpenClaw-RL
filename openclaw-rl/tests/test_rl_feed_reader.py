@@ -36,8 +36,18 @@ def test_read_package_loads_and_validates() -> None:
 def test_read_package_plaintext_turns_loads() -> None:
     pkg = read_package(FIXTURE_ROOT, PKG_ID_2)
     assert pkg.package_id == PKG_ID_2
-    assert pkg.turns[0].prompt_text is not None
-    assert pkg.turns[1].response_text is not None
+    assert len(pkg.turns) == 3
+
+    user_turn = next((t for t in pkg.turns if t.role == "user"), None)
+    tool_turn = next((t for t in pkg.turns if t.role == "tool"), None)
+    assistant_turn = next((t for t in pkg.turns if t.role == "assistant"), None)
+
+    assert user_turn is not None and user_turn.contentScrubbed is not None
+    assert tool_turn is not None and tool_turn.contentScrubbed is None
+    assert assistant_turn is not None and assistant_turn.contentScrubbed is not None
+
+    # Strict contract alignment: tool turns must include `toolName` in real exports.
+    assert tool_turn.toolName is not None
 
 
 def test_read_package_rejects_missing_file(tmp_path: Path) -> None:

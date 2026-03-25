@@ -2,92 +2,79 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-
-class TrajectoryTurn(BaseModel):
-    """
-    Minimal representation of one turn inside PR10A `trajectories/{packageId}.jsonl`.
-
-    PR10A is documented as hashes + roles (privacy-first), so this model is
-    written to be "hash-compatible" (no plaintext required for parsing).
-    """
-
-    model_config = ConfigDict(extra="ignore", strict=True)
-
-    idx: int | None = None
-    role: str
-
-    # Hash-only export fields (privacy-preserving). If plaintext export is added
-    # later, these fields may be replaced or supplemented.
-    promptHash: str | None = None
-    responseHash: str | None = None
-
-    # Optional plaintext export fields (not expected in v1; mapper will refuse
-    # training if plaintext is missing).
-    prompt_text: str | None = None
-    response_text: str | None = None
-
-    @model_validator(mode="after")
-    def _require_role_and_hash_or_plaintext(self) -> "TrajectoryTurn":
-        if not self.role or not isinstance(self.role, str):
-            raise ValueError("TrajectoryTurn.role must be a non-empty string")
-
-        have_hash = bool(self.promptHash) or bool(self.responseHash)
-        have_plaintext = bool(self.prompt_text) or bool(self.response_text)
-        if not (have_hash or have_plaintext):
-            raise ValueError(
-                "TrajectoryTurn must include at least one of: promptHash/responseHash or prompt_text/response_text"
-            )
-        return self
+RewardSignalKind = Literal["binary", "directional", "combined"]
+SuggestedRLMethod = Literal["binary", "opd", "combined"]
+ConsentScope = Literal["local_only", "hive_anonymous", "hive_attributed"]
 
 
 class RewardSignal(BaseModel):
     """
-    Minimal reward signal shape for PR10A `rewards/{packageId}.json`.
+    PR10A reward signal (from `openclaw` research events).
+
+    This matches `src/research/events/types.ts`:
+    - kind ∈ {binary,directional,combined}
+    - source ∈ {user_explicit,user_implicit,env_outcome,approval_decision}
+    - confidence ∈ [0,1]
+    - scalar ∈ [-1,1] (optional)
     """
 
-    model_config = ConfigDict(extra="ignore", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-    kind: str | None = None
-
-    # OpenClaw-RL online path uses `{"score": ...}` in Sample.reward.
-    # For offline feed ingestion, support both `score` and `scalar`.
-    score: float | None = None
-    scalar: float | None = None
-
-    # Optional fields for provenance / confidence.
-    source: str | None = None
-    confidence: float | None = None
+    kind: RewardSignalKind
+    source: Literal["user_explicit", "user_implicit", "env_outcome", "approval_decision"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    scalar: float | None = Field(default=None, ge=-1.0, le=1.0)
     hintText: str | None = None
 
-    @model_validator(mode="after")
-    def _require_score_like(self) -> "RewardSignal":
-        if self.score is None and self.scalar is None:
-            raise ValueError("RewardSignal must provide either `score` or `scalar`")
-        return self
 
-    def to_score(self) -> float:
-        return float(self.score if self.score is not None else self.scalar)  # type: ignore[arg-type]
+class TrajectoryTurn(BaseModel):
+    """
+    One line inside PR10A:
+      `rl-feed/trajectories/{packageId}.jsonl`
+
+    Key alignment:
+    - `turnId`, `contentHash`, `stepIdx` are always present.
+    - `contentScrubbed`, `toolName`, `rewardSignal` are optional.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    turnId: str
+    role: Literal["user", "assistant", "tool"]
+    contentHash: str
+    contentScrubbed: str | None = None
+    toolName: str | None = None
+    rewardSignal: RewardSignal | None = None
+    stepIdx: int
 
 
 class RewardsFile(BaseModel):
-    model_config = ConfigDict(extra="ignore", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     packageId: str
-    signals: list[RewardSignal] = Field(default_factory=list)
+    signals: list[RewardSignal]
 
 
 class MetadataFile(BaseModel):
-    model_config = ConfigDict(extra="ignore", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True)
 
+    schemaVersion: Literal["trajectory.v2"]
     packageId: str
-    dominantSignalKind: str | None = None
-    suggestedRLMethod: str | None = None
-
-    # Keep other fields possible, but v1 mapper only relies on these.
+    agentId: str
+    createdAt: int
+    runId: str
+    sessionId: str
+    dominantSignalKind: RewardSignalKind
+    suggestedRLMethod: SuggestedRLMethod
+    skillsActivated: list[str]
+    sessionRecallHits: int
+    scrubbed: bool
+    consentScope: ConsentScope
+    turnCount: int
 
 
 @dataclass(frozen=True)
@@ -100,7 +87,11 @@ class ParsedPackage:
 
 def parse_jsonl_turns(jsonl_text: str) -> list[TrajectoryTurn]:
     """
-    Parse PR10A trajectories JSONL into validated TrajectoryTurn objects.
+    Parse PR10A trajectories JSONL into validated `TrajectoryTurn` objects.
+
+    Fail fast on:
+    - invalid JSON
+    - strict field/key mismatches
     """
 
     turns: list[TrajectoryTurn] = []

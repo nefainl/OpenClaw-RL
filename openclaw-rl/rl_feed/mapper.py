@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from .types import ParsedPackage, RewardSignal, TrajectoryTurn
 
@@ -52,56 +52,104 @@ def _load_sample_class():
 
 Sample = _load_sample_class()
 
+_STATUS_FAILED = Sample.Status.FAILED if hasattr(Sample, "Status") else "failed"  # type: ignore[comparison-overlap]
+_STATUS_COMPLETED = Sample.Status.COMPLETED if hasattr(Sample, "Status") else "completed"  # type: ignore[comparison-overlap]
+
+
+def _map_reward_signal_to_score(signal: RewardSignal) -> float:
+    # OpenClaw-RL offline reward must be binary-compatible via scalar sign.
+    # - scalar > 0 => 1
+    # - scalar < 0 => -1
+    # - scalar == 0 or missing => 0
+    scalar = signal.scalar
+    if scalar is None or scalar == 0:
+        return 0.0
+    if scalar > 0:
+        return 1.0
+    return -1.0
+
 
 def _select_reward_score(signals: Iterable[RewardSignal], dominant_kind: str | None) -> float:
     signals_list = list(signals)
     if not signals_list:
-        raise ValueError("RewardsFile.signals is empty; cannot derive scalar reward score")
+        return 0.0
 
     if dominant_kind:
         for s in signals_list:
             if s.kind == dominant_kind:
-                return s.to_score()
+                return _map_reward_signal_to_score(s)
 
-    # Fallback: first signal with a score/scalar.
-    return signals_list[0].to_score()
+    return _map_reward_signal_to_score(signals_list[0])
 
 
-def _maybe_tokenize_from_plaintext(args: Any, turns: list[TrajectoryTurn]) -> tuple[list[int], list[int], str]:
+def _maybe_tokenize_from_scrubbed_content(
+    args: Any,
+    *,
+    prompt_messages: list[dict[str, str]],
+    response_text: str,
+) -> tuple[list[int], list[int], int]:
     """
-    Tokenize plaintext prompt/response into (tokens, loss_mask, response_text).
+    Tokenize (prompt_messages + response_text) into:
+    - tokens = prompt_ids + response_ids
+    - loss_mask = [1] * len(response_ids)  (response-only loss)
+    - response_length = len(response_ids)
 
-    This is only attempted if plaintext fields are present in the feed export.
-    In this repo's planning context, PR10A is hashes-only, so tests won't hit
-    this path.
+    Tokenization mirrors `external/openclaw-rl/openclaw-rl/openclaw_api_server.py`:
+    - prompt_ids from tokenizer.apply_chat_template(..., tokenize=False, add_generation_prompt=True)
+    - response_ids from tokenizer(response_text, add_special_tokens=False)
     """
 
-    # Lazy import to avoid pulling transformers in environments that only run unit tests.
+    # Lazy import to avoid pulling heavy deps in unit test environments.
     from slime.utils.processing_utils import load_tokenizer  # type: ignore
 
     tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
 
-    # Heuristic: use prompt_text from all turns that have it; use the last
-    # available response_text as the training response.
-    prompt_messages: list[dict[str, str]] = []
-    last_response: str | None = None
-    for t in turns:
-        if t.prompt_text:
-            prompt_messages.append({"role": t.role, "content": t.prompt_text})
-        if t.response_text:
-            last_response = t.response_text
+    prompt_text = tokenizer.apply_chat_template(
+        prompt_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    response_ids = tokenizer(response_text, add_special_tokens=False)["input_ids"]
 
-    if not prompt_messages or not last_response:
-        raise ValueError("Plaintext export detected but missing prompt_text/response_text for tokenization")
-
-    # Mirror openclaw_api_server's "apply_chat_template(messages, tokenize=True, add_generation_prompt=True)" workflow.
-    input_ids = tokenizer.apply_chat_template(prompt_messages, tokenize=True, add_generation_prompt=True)
-    response_ids = tokenizer(last_response, add_special_tokens=False)["input_ids"]
-
-    # Tokens = prompt + response. Loss is response-only.
-    tokens = list(input_ids) + list(response_ids)
+    tokens = list(prompt_ids) + list(response_ids)
     loss_mask = [1] * len(response_ids)
-    return tokens, loss_mask, last_response
+    return tokens, loss_mask, len(response_ids)
+
+
+def _build_prompt_messages_for_assistant(
+    turns_sorted: Sequence[TrajectoryTurn],
+    assistant_turn_index: int,
+) -> tuple[list[dict[str, str]], str]:
+    assistant_turn = turns_sorted[assistant_turn_index]
+
+    if assistant_turn.role != "assistant":
+        raise ValueError("assistant_turn_index must point at an assistant turn")
+
+    if assistant_turn.contentScrubbed is None:
+        raise ValueError("Missing contentScrubbed on assistant turn")
+
+    response_text = assistant_turn.contentScrubbed
+    prompt_messages: list[dict[str, str]] = []
+
+    for t in turns_sorted[:assistant_turn_index]:
+        # Safety: tool turns do not carry enough structure for tool-aware chat templates in v1,
+        # so we exclude them from prompt tokenization.
+        if t.role == "tool":
+            continue
+
+        if t.role not in ("user", "assistant"):
+            continue
+
+        if t.contentScrubbed is None:
+            raise ValueError(f"Missing contentScrubbed on {t.role} turn")
+
+        prompt_messages.append({"role": t.role, "content": t.contentScrubbed})
+
+    if not prompt_messages:
+        raise ValueError("Tokenization refused: prompt_messages is empty")
+
+    return prompt_messages, response_text
 
 
 def package_to_sample_groups(args: Any, package: ParsedPackage) -> list[list[Any]]:
@@ -109,67 +157,79 @@ def package_to_sample_groups(args: Any, package: ParsedPackage) -> list[list[Any
     Convert a package into SLIME sample groups.
 
     Chosen v1 policy:
-    - One package => one group.
-    - If token reconstruction is not possible (hash-only export), emit samples
-      with reward set, but mark them FAILED and `remove_sample=True` so
-      training pipelines can safely drop them.
+    - One Sample group per assistant turn (Option A).
+    - If token reconstruction is not possible (missing `contentScrubbed` for required
+      roles), emit samples with reward set, but mark them FAILED and `remove_sample=True`
+      so training pipelines can safely drop them.
     """
 
     dominant_kind = getattr(package.metadata, "dominantSignalKind", None)
-    score = _select_reward_score(package.rewards.signals, dominant_kind)
+    score = _select_reward_score(package.rewards.signals, str(dominant_kind) if dominant_kind else None)
     reward = {"score": float(score)}
 
     n_samples_per_prompt = int(getattr(args, "n_samples_per_prompt", 1))
 
-    # PR10A turns (or future plaintext-enabled exports) are expected to carry
-    # prompt text and response text on different turns. Tokenization is only
-    # possible if we have at least one prompt and one response.
-    has_prompt_text = any(t.prompt_text is not None for t in package.turns)
-    has_response_text = any(t.response_text is not None for t in package.turns)
-    plaintext_ok = has_prompt_text and has_response_text
+    turns_sorted = sorted(package.turns, key=lambda t: (t.stepIdx, t.turnId))
+    assistant_indices = [i for i, t in enumerate(turns_sorted) if t.role == "assistant"]
 
-    group_index = 0
-    base_index = 0
+    groups: list[list[Any]] = []
+    for assistant_idx in assistant_indices:
+        assistant_turn = turns_sorted[assistant_idx]
 
-    tokens: list[int] = []
-    response_length = 0
-    response_text = ""
-    loss_mask: list[int] | None = None
-    status = Sample.Status.FAILED if hasattr(Sample, "Status") else "failed"  # type: ignore[comparison-overlap]
-    remove_sample = True
+        tokens: list[int] = []
+        response_length = 0
+        response_text = ""
+        loss_mask: list[int] | None = None
+        status = _STATUS_FAILED
+        remove_sample = True
 
-    if plaintext_ok:
-        # Tokenization is best-effort. If it fails, keep refusal mode.
         try:
-            tokens, loss_mask, response_text = _maybe_tokenize_from_plaintext(args, package.turns)
-            response_length = len(tokens) - 0  # response_length should be response-only, corrected below
-            # loss_mask is response-only.
-            response_length = len(loss_mask)
-            status = Sample.Status.COMPLETED  # type: ignore[assignment]
+            prompt_messages, response_text_candidate = _build_prompt_messages_for_assistant(
+                turns_sorted, assistant_idx
+            )
+            # Only attempt tokenization when we have scrubbed prompt/response strings.
+            if not hasattr(args, "hf_checkpoint"):
+                raise ValueError("hf_checkpoint missing")
+
+            tokens, loss_mask, response_length = _maybe_tokenize_from_scrubbed_content(
+                args,
+                prompt_messages=prompt_messages,
+                response_text=response_text_candidate,
+            )
+            response_text = response_text_candidate
+            status = _STATUS_COMPLETED
             remove_sample = False
-        except Exception:  # pragma: no cover
-            # Hash-only contract is the expected path; keep samples non-trainable on errors.
+        except Exception:
+            # Deterministic refusal: hash-only feeds (no contentScrubbed) end here.
             tokens = []
             response_length = 0
             response_text = ""
             loss_mask = None
-            status = Sample.Status.FAILED  # type: ignore[assignment]
+            status = _STATUS_FAILED
             remove_sample = True
 
-    group: list[Any] = []
-    for i in range(n_samples_per_prompt):
-        s = Sample()
-        s.group_index = group_index
-        s.index = base_index + i
-        s.tokens = list(tokens)
-        s.response = response_text
-        s.response_length = int(response_length)
-        s.reward = reward
-        s.loss_mask = loss_mask
-        s.status = status
-        s.remove_sample = remove_sample
-        s.metadata = {"packageId": package.package_id}
-        group.append(s)
+        group: list[Any] = []
+        group_index = int(assistant_turn.stepIdx)
+        base_index = group_index * n_samples_per_prompt
 
-    return [group]
+        for i in range(n_samples_per_prompt):
+            s = Sample()
+            s.group_index = group_index
+            s.index = base_index + i
+            s.tokens = list(tokens)
+            s.response = response_text
+            s.response_length = int(response_length)
+            s.reward = reward
+            s.loss_mask = loss_mask
+            s.status = status
+            s.remove_sample = remove_sample
+            s.metadata = {
+                "packageId": package.package_id,
+                "turnId": assistant_turn.turnId,
+            }
+            group.append(s)
+
+        groups.append(group)
+
+    return groups
 

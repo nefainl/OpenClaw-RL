@@ -60,5 +60,13 @@ def read_package(root: Path, package_id: str) -> ParsedPackage:
     if not turns:
         raise ValueError(f"Empty trajectories file for packageId={package_id}")
 
+    # PR10A exporter encodes `packageId` inside `turnId` as `${packageId}-t${stepIdx}`.
+    turn_id_prefix = f"{package_id}-t"
+    if not all(t.turnId.startswith(turn_id_prefix) for t in turns):
+        bad = next(t.turnId for t in turns if not t.turnId.startswith(turn_id_prefix))
+        raise ValueError(
+            f"packageId mismatch in trajectories: expected_prefix={turn_id_prefix} bad_turnId={bad}"
+        )
+
     return ParsedPackage(package_id=package_id, turns=turns, rewards=rewards, metadata=metadata)
 
