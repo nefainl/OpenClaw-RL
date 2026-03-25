@@ -121,11 +121,12 @@ def package_to_sample_groups(args: Any, package: ParsedPackage) -> list[list[Any
 
     n_samples_per_prompt = int(getattr(args, "n_samples_per_prompt", 1))
 
-    any_plaintext = any(t.prompt_text or t.response_text for t in package.turns)
-    plaintext_ok = all(
-        (t.prompt_text is not None and t.response_text is not None) or not any_plaintext
-        for t in package.turns
-    )
+    # PR10A turns (or future plaintext-enabled exports) are expected to carry
+    # prompt text and response text on different turns. Tokenization is only
+    # possible if we have at least one prompt and one response.
+    has_prompt_text = any(t.prompt_text is not None for t in package.turns)
+    has_response_text = any(t.response_text is not None for t in package.turns)
+    plaintext_ok = has_prompt_text and has_response_text
 
     group_index = 0
     base_index = 0
@@ -137,7 +138,7 @@ def package_to_sample_groups(args: Any, package: ParsedPackage) -> list[list[Any
     status = Sample.Status.FAILED if hasattr(Sample, "Status") else "failed"  # type: ignore[comparison-overlap]
     remove_sample = True
 
-    if any_plaintext and plaintext_ok:
+    if plaintext_ok:
         # Tokenization is best-effort. If it fails, keep refusal mode.
         try:
             tokens, loss_mask, response_text = _maybe_tokenize_from_plaintext(args, package.turns)

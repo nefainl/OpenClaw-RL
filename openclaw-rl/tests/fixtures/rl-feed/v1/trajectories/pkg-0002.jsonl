@@ -1,0 +1,3 @@
+{"idx":0,"role":"user","prompt_text":"Hello from user"}
+{"idx":1,"role":"assistant","response_text":"Hello from assistant"}
+
